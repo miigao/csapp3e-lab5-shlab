@@ -2,6 +2,7 @@
  * tsh - A tiny shell program with job control
  * 
  * <Put your name and login ID here>
+ * miigao
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -165,6 +166,47 @@ int main(int argc, char **argv)
 */
 void eval(char *cmdline) 
 {
+	char *argv[MAXARGS];
+	char buf[MAXLINE];
+	int bg, state;
+	pid_t pid;
+	sigset_t mask, prev_mask;
+	strcpy(buf, cmdline);
+	bg = parseline(buf, argv);
+	if (argv[0] == NULL) return;
+	sigemptyset(&mask);
+	sigaddset(&mask, SIGCHLD);
+	if (!builtin_cmd(argv)) {
+		sigprocmask(SIG_BLOCK, &mask, &prev_mask);
+		if ((pid = fork()) < 0) {
+			fprintf(stderr, "fork error: %s\n", strerror(errno));
+			exit(0);
+		}
+		if (pid == 0) {
+			setpgid(0, 0);
+			sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+			if (execve(argv[0], argv, environ) < 0) {
+				printf("%s: Command not found.\n", argv[0]);
+				exit(0);
+			}
+		}
+		else {
+			if (bg)
+				state = BG;
+			else
+				state = FG;
+			addjob(jobs, pid, state, cmdline);
+			sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+		}
+			
+		if (!bg) {
+			waitfg(pid);
+		}
+		else {
+			printf("[%d] (%d) %s", pid2jid(pid), pid, cmdline);
+		}
+			
+	}
     return;
 }
 
@@ -231,6 +273,26 @@ int parseline(const char *cmdline, char **argv)
  */
 int builtin_cmd(char **argv) 
 {
+	if (!strcmp(argv[0], "quit"))
+		exit(0);
+	if (!strcmp(argv[0], "jobs")) {
+		listjobs(jobs);
+		return 1;
+	}
+	if (!strcmp(argv[0], "bg")) {
+		if (argv[1] == NULL)
+			printf("fg command requires PID or %%jobid argument\n");
+		else
+			do_bgfg(argv);
+		return 1;
+	}
+	if (!strcmp(argv[0], "fg")) {
+		if (argv[1] == NULL)
+			printf("fg command requires PID or %%jobid argument\n");
+		else
+			do_bgfg(argv);
+		return 1;
+	}
     return 0;     /* not a builtin command */
 }
 
@@ -239,6 +301,53 @@ int builtin_cmd(char **argv)
  */
 void do_bgfg(char **argv) 
 {
+	int i;
+	struct job_t *jp;
+	pid_t pid;
+	int tmp;
+	if (!strcmp(argv[0], "bg"))
+		tmp = BG;
+	else
+		tmp = FG;
+	if (argv[1][0] == '%') {
+		i = 1;
+		while (argv[1][i] != '\0' && isdigit(argv[1][i])) i++;
+		if (argv[1][i] != '\0') {
+			printf("%s: argument must be a PID or %%jobid\n", argv[0]);
+			return;
+		}
+		jp = getjobjid(jobs, atoi(&argv[1][1]));
+		if (jp == NULL) {
+			printf("%s: No such job\n", argv[1]);
+			return;
+		}
+		jp->state = tmp;
+		kill(-(jp->pid), SIGCONT);
+		if (tmp == FG)
+			waitfg(jp->pid);
+		else
+			printf("[%d] (%d) %s", jp->jid, jp->pid, jp->cmdline);
+	}
+	else {
+		i = 0;
+		while (argv[1][i] != '\0' && isdigit(argv[1][i])) i++;
+		if (argv[1][i] != '\0') {
+			printf("%s: argument must be a PID or %%jobid\n", argv[0]);
+			return;
+		}
+		pid = atoi(argv[1]);
+		jp = getjobpid(jobs, pid);
+		if (jp == NULL) {
+			printf("(%s): No such process\n", argv[1]);
+			return;
+		}
+		jp->state = tmp;
+		kill(-pid, SIGCONT);
+		if (tmp == FG)
+			waitfg(pid);
+		else
+			printf("[%d] (%d) %s", jp->jid, pid, jp->cmdline);
+	}
     return;
 }
 
@@ -247,6 +356,13 @@ void do_bgfg(char **argv)
  */
 void waitfg(pid_t pid)
 {
+	struct job_t *jp = getjobpid(jobs, pid);
+	if (jp == NULL) return;
+	pid = getpid();
+	while (jp->state == FG) {
+		sleep(1);
+		kill(-pid, SIGCHLD);
+	}
     return;
 }
 
@@ -263,16 +379,41 @@ void waitfg(pid_t pid)
  */
 void sigchld_handler(int sig) 
 {
+	int olderrno = errno;
+	int status;
+	pid_t pid;
+	struct job_t *jp;
+	pid = waitpid(-1, &status, WNOHANG | WUNTRACED);
+	if (WIFSTOPPED(status)) {
+		jp = getjobpid(jobs, pid);
+		if (jp->state != ST)
+			printf("Job [%d] (%d) stopped by signal 20\n", pid2jid(pid), pid);
+		jp->state = ST;
+	}
+	else {
+		if (!(WIFEXITED(status)) && pid2jid(pid) > 0)
+			printf("Job [%d] (%d) terminated by signal 2\n", pid2jid(pid), pid);
+		deletejob(jobs, pid);
+	}
+	errno = olderrno;
     return;
 }
 
 /* 
- * sigint_handler - The kernel sends a SIGINT to the shell whenver the
+ * sigint_handler - The kernel sends a SIGINT to the shell whenever the
  *    user types ctrl-c at the keyboard.  Catch it and send it along
  *    to the foreground job.  
  */
 void sigint_handler(int sig) 
 {
+	int olderrno = errno;
+	pid_t pid;
+	pid = fgpid(jobs);
+	if (!pid) return;
+	printf("Job [%d] (%d) terminated by signal %d\n", pid2jid(pid), pid, sig);
+	deletejob(jobs, pid);
+	kill(-pid, sig);
+	errno = olderrno;
     return;
 }
 
@@ -283,6 +424,16 @@ void sigint_handler(int sig)
  */
 void sigtstp_handler(int sig) 
 {
+	int olderrno = errno;
+	struct job_t *jp;
+	pid_t pid;
+	pid = fgpid(jobs);
+	if (!pid) return;
+	printf("Job [%d] (%d) stopped by signal %d\n", pid2jid(pid), pid, sig);
+	jp = getjobpid(jobs, pid);
+	jp->state = ST;
+	kill(-pid, sig);
+	errno = olderrno;
     return;
 }
 
